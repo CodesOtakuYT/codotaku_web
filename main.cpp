@@ -7,20 +7,15 @@
 #include <source_location>
 #include <span>
 #include <SDL3/SDL_main.h>
-
 #include "SDL3/SDL_log.h"
 #include "SDL3/SDL_timer.h"
 #include "SDL3/SDL_vulkan.h"
 #include <include/gpu/vk/VulkanBackendContext.h>
-#include <include/gpu/vk/VulkanMemoryAllocator.h>
 #include "src/gpu/vk/vulkanmemoryallocator/VulkanMemoryAllocatorPriv.h"
 #include <include/gpu/vk/VulkanExtensions.h>
 #include <include/gpu/vk/VulkanPreferredFeatures.h>
-
 #include <VkBootstrap.h>
-
 #include "src/gpu/GpuTypesPriv.h"
-#include "src/gpu/vk/vulkanmemoryallocator/VulkanMemoryAllocatorPriv.h"
 #include "include/gpu/graphite/Context.h"
 #include "include/gpu/graphite/vk/VulkanGraphiteContext.h"
 #include "include/gpu/graphite/vk/VulkanGraphiteTypes.h"
@@ -29,11 +24,14 @@
 #include "include/gpu/graphite/Surface.h"
 #include "include/gpu/graphite/GraphiteTypes.h"
 #include "include/gpu/graphite/BackendSemaphore.h"
-#include "include/gpu/graphite/Recording.h"
 #include "include/gpu/MutableTextureState.h"
 #include "include/gpu/vk/VulkanMutableTextureState.h"
 #include "include/core/SkColorSpace.h"
 #include "include/core/SkCanvas.h"
+#include "include/gpu/graphite/Context.h"
+#include "litehtml/document.h"
+#include "litehtml/document_container.h"
+#include "litehtml/html_tag.h"
 
 auto chkSDL(bool result, std::source_location loc = {}) {
     if (!result) {
@@ -64,6 +62,396 @@ static auto chk(VkResult res, std::source_location loc = {}) -> void {
 
 static constexpr int MAX_FRAMES = 2;
 
+#include <include/core/SkFontMgr.h>
+#include <include/ports/SkTypeface_win.h>
+#include <include/core/SkFont.h>
+#include <include/core/SkFontMetrics.h>
+#include <include/core/SkData.h>
+#include <include/core/SkImage.h>
+#include <include/effects/SkGradient.h>
+
+struct SkiaFont {
+    SkFont font;
+    litehtml::font_metrics metrics;
+};
+
+class DocumentContainer : public litehtml::document_container {
+    std::string baseUrl_;
+    sk_sp<SkFontMgr> m_fontMgr;
+    std::map<std::string, sk_sp<SkImage> > images_;
+
+protected:
+    int width_ = 800;
+    int height_ = 600;
+
+public:
+    DocumentContainer() {
+        m_fontMgr = SkFontMgr_New_DirectWrite();
+    }
+
+    void set_size(int w, int h) {
+        width_ = w;
+        height_ = h;
+    }
+
+    litehtml::uint_ptr create_font(const litehtml::font_description &descr, const litehtml::document *doc,
+                                   litehtml::font_metrics *fm) override {
+        SkFontStyle style(descr.weight, SkFontStyle::kNormal_Weight,
+                          descr.style == litehtml::font_style_italic
+                              ? SkFontStyle::kItalic_Slant
+                              : SkFontStyle::kUpright_Slant);
+
+        sk_sp<SkTypeface> typeface;
+        std::stringstream families(descr.family);
+        std::string family;
+        while (std::getline(families, family, ',')) {
+            size_t start = family.find_first_not_of(" \t\"'");
+            size_t end = family.find_last_not_of(" \t\"'");
+            if (start == std::string::npos) continue;
+            family = family.substr(start, end - start + 1);
+
+            if (family == "sans-serif") family = "Arial";
+            else if (family == "serif") family = "Times New Roman";
+            else if (family == "monospace") family = "Consolas";
+            else if (family == "cursive") family = "Comic Sans MS";
+
+            typeface = m_fontMgr->matchFamilyStyle(family.c_str(), style);
+            if (typeface) break;
+        }
+        if (!typeface)
+            typeface = m_fontMgr->legacyMakeTypeface(nullptr, style);
+
+        auto font = std::make_unique<SkiaFont>();
+        font->font.setTypeface(typeface);
+        font->font.setSize(descr.size);
+        font->font.setSubpixel(true);
+        font->font.setEdging(SkFont::Edging::kSubpixelAntiAlias);
+
+        SkFontMetrics skfm;
+        font->font.getMetrics(&skfm);
+
+        fm->font_size = descr.size;
+        fm->ascent = ceilf(-skfm.fAscent);
+        fm->descent = ceilf(skfm.fDescent);
+        fm->height = ceilf(-skfm.fAscent + skfm.fDescent + skfm.fLeading);
+        fm->x_height = ceilf(skfm.fXHeight);
+        fm->ch_width = ceilf(font->font.measureText("0", 1, SkTextEncoding::kUTF8));
+
+        font->metrics = *fm;
+
+        return reinterpret_cast<litehtml::uint_ptr>(font.release());
+    }
+
+    void delete_font(litehtml::uint_ptr hFont) override {
+        delete reinterpret_cast<SkiaFont *>(hFont);
+    }
+
+    litehtml::pixel_t text_width(const char *text, litehtml::uint_ptr hFont) override {
+        auto font = reinterpret_cast<SkiaFont *>(hFont);
+        return static_cast<int>(ceilf(font->font.measureText(text, strlen(text), SkTextEncoding::kUTF8)));
+    }
+
+    void draw_text(litehtml::uint_ptr hdc, const char *text, litehtml::uint_ptr hFont, litehtml::web_color color,
+                   const litehtml::position &pos) override {
+        auto canvas = reinterpret_cast<SkCanvas *>(hdc);
+        auto font = reinterpret_cast<SkiaFont *>(hFont);
+
+        SkPaint paint;
+        paint.setColor(SkColorSetARGB(color.alpha, color.red, color.green, color.blue));
+        paint.setAntiAlias(true);
+
+        canvas->drawSimpleText(text, strlen(text), SkTextEncoding::kUTF8, pos.x, pos.y + font->metrics.ascent,
+                               font->font, paint);
+    }
+
+    litehtml::pixel_t pt_to_px(float pt) const override {
+        return pt * 96.0f / 72.0f;
+    }
+
+    litehtml::pixel_t get_default_font_size() const override {
+        return 16;
+    }
+
+    const char *get_default_font_name() const override {
+        return "sans-serif";
+    }
+
+    void draw_list_marker(litehtml::uint_ptr hdc, const litehtml::list_marker &marker) override {
+        auto canvas = reinterpret_cast<SkCanvas *>(hdc);
+        SkPaint paint;
+        paint.setColor(SkColorSetARGB(marker.color.alpha, marker.color.red, marker.color.green, marker.color.blue));
+        paint.setAntiAlias(true);
+
+        float r = marker.pos.width / 4.0f;
+        float cx = marker.pos.x + marker.pos.width / 2.0f;
+        float cy = marker.pos.y + marker.pos.height / 2.0f;
+
+        switch (marker.marker_type) {
+            case litehtml::list_style_type_circle:
+                paint.setStyle(SkPaint::kStroke_Style);
+                canvas->drawCircle(cx, cy, r, paint);
+                break;
+            case litehtml::list_style_type_disc:
+                paint.setStyle(SkPaint::kFill_Style);
+                canvas->drawCircle(cx, cy, r, paint);
+                break;
+            case litehtml::list_style_type_square:
+                paint.setStyle(SkPaint::kFill_Style);
+                canvas->drawRect(SkRect::MakeXYWH(cx - r, cy - r, r * 2, r * 2), paint);
+                break;
+            default:
+                break;
+        }
+    }
+
+    void load_image(const char *src, const char *baseurl, bool redraw_on_ready) override {
+        if (images_.contains(src)) return;
+
+        size_t size;
+        void *data = SDL_LoadFile(src, &size);
+        if (data) {
+            auto skData = SkData::MakeWithCopy(data, size);
+            SDL_free(data);
+            auto image = SkImages::DeferredFromEncodedData(skData);
+            if (image)
+                images_[src] = image;
+        }
+    }
+
+    void get_image_size(const char *src, const char *baseurl, litehtml::size &sz) override {
+        auto it = images_.find(src);
+        if (it != images_.end()) {
+            sz.width = it->second->width();
+            sz.height = it->second->height();
+        } else {
+            sz.width = 0;
+            sz.height = 0;
+        }
+    }
+
+    void draw_image(litehtml::uint_ptr hdc, const litehtml::background_layer &layer, const std::string &url,
+                    const std::string &base_url) override {
+        auto canvas = reinterpret_cast<SkCanvas *>(hdc);
+        auto it = images_.find(url);
+        if (it != images_.end()) {
+            canvas->drawImageRect(
+                it->second, SkRect::MakeXYWH(layer.border_box.x, layer.border_box.y, layer.border_box.width,
+                                             layer.border_box.height), SkSamplingOptions());
+        }
+    }
+
+    void draw_solid_fill(litehtml::uint_ptr hdc, const litehtml::background_layer &layer,
+                         const litehtml::web_color &color) override {
+        auto canvas = reinterpret_cast<SkCanvas *>(hdc);
+        SkPaint paint;
+        paint.setColor(SkColorSetARGB(color.alpha, color.red, color.green, color.blue));
+        paint.setAntiAlias(true);
+
+        canvas->drawRect(SkRect::MakeXYWH(layer.border_box.x, layer.border_box.y,
+                                          layer.border_box.width, layer.border_box.height), paint);
+    }
+
+    void draw_linear_gradient(litehtml::uint_ptr hdc, const litehtml::background_layer &layer,
+                              const litehtml::background_layer::linear_gradient &gradient) override {
+        auto canvas = reinterpret_cast<SkCanvas *>(hdc);
+
+        std::vector<SkColor4f> colors;
+        std::vector<float> pos;
+        for (const auto &cp: gradient.color_points) {
+            colors.push_back(SkColor4f{
+                cp.color.red / 255.0f, cp.color.green / 255.0f, cp.color.blue / 255.0f, cp.color.alpha / 255.0f
+            });
+            pos.push_back(cp.offset);
+        }
+
+        SkPoint pts[2] = {
+            {gradient.start.x, gradient.start.y},
+            {gradient.end.x, gradient.end.y},
+        };
+
+        SkGradient skGrad(SkGradient::Colors(SkSpan(colors), SkSpan(pos), SkTileMode::kClamp),
+                          SkGradient::Interpolation());
+        auto shader = SkShaders::LinearGradient(pts, skGrad);
+
+        SkPaint paint;
+        paint.setShader(shader);
+        paint.setAntiAlias(true);
+
+        canvas->drawRect(SkRect::MakeXYWH(layer.border_box.x, layer.border_box.y,
+                                          layer.border_box.width, layer.border_box.height), paint);
+    }
+
+    void draw_radial_gradient(litehtml::uint_ptr hdc, const litehtml::background_layer &layer,
+                              const litehtml::background_layer::radial_gradient &gradient) override {
+        auto canvas = reinterpret_cast<SkCanvas *>(hdc);
+
+        std::vector<SkColor4f> colors;
+        std::vector<float> pos;
+        for (const auto &cp: gradient.color_points) {
+            colors.push_back(SkColor4f{
+                cp.color.red / 255.0f, cp.color.green / 255.0f, cp.color.blue / 255.0f, cp.color.alpha / 255.0f
+            });
+            pos.push_back(cp.offset);
+        }
+
+        SkPoint center = {gradient.position.x, gradient.position.y};
+        float radius = gradient.radius.x;
+
+        SkGradient skGrad(SkGradient::Colors(SkSpan(colors), SkSpan(pos), SkTileMode::kClamp),
+                          SkGradient::Interpolation());
+        auto shader = SkShaders::RadialGradient(center, radius, skGrad);
+
+        SkPaint paint;
+        paint.setShader(shader);
+        paint.setAntiAlias(true);
+
+        canvas->drawRect(SkRect::MakeXYWH(layer.border_box.x, layer.border_box.y,
+                                          layer.border_box.width, layer.border_box.height), paint);
+    }
+
+    void draw_conic_gradient(litehtml::uint_ptr hdc, const litehtml::background_layer &layer,
+                             const litehtml::background_layer::conic_gradient &gradient) override {
+        auto canvas = reinterpret_cast<SkCanvas *>(hdc);
+
+        std::vector<SkColor4f> colors;
+        std::vector<float> pos;
+        for (const auto &cp: gradient.color_points) {
+            colors.push_back(SkColor4f{
+                cp.color.red / 255.0f, cp.color.green / 255.0f, cp.color.blue / 255.0f, cp.color.alpha / 255.0f
+            });
+            pos.push_back(cp.offset);
+        }
+
+        SkPoint center = {gradient.position.x, gradient.position.y};
+
+        SkGradient skGrad(SkGradient::Colors(SkSpan(colors), SkSpan(pos), SkTileMode::kClamp),
+                          SkGradient::Interpolation());
+        auto shader = SkShaders::SweepGradient(center, skGrad);
+
+        SkPaint paint;
+        paint.setShader(shader);
+        paint.setAntiAlias(true);
+
+        canvas->drawRect(SkRect::MakeXYWH(layer.border_box.x, layer.border_box.y,
+                                          layer.border_box.width, layer.border_box.height), paint);
+    }
+
+    void draw_borders(litehtml::uint_ptr hdc, const litehtml::borders &borders, const litehtml::position &draw_pos,
+                      bool root) override {
+        auto canvas = reinterpret_cast<SkCanvas *>(hdc);
+
+        auto draw_border = [&](const litehtml::border &b, float x, float y, float w, float h) {
+            if (b.width <= 0 || b.style == litehtml::border_style_none || b.style == litehtml::border_style_hidden)
+                return;
+            SkPaint paint;
+            paint.setColor(SkColorSetARGB(b.color.alpha, b.color.red, b.color.green, b.color.blue));
+            paint.setAntiAlias(true);
+            canvas->drawRect(SkRect::MakeXYWH(x, y, w, h), paint);
+        };
+
+        draw_border(borders.top, draw_pos.x, draw_pos.y, draw_pos.width,
+                    borders.top.width);
+        draw_border(borders.bottom, draw_pos.x, draw_pos.y + draw_pos.height - borders.bottom.width,
+                    draw_pos.width, borders.bottom.width);
+        draw_border(borders.left, draw_pos.x, draw_pos.y, borders.left.width,
+                    draw_pos.height);
+        draw_border(borders.right, draw_pos.x + draw_pos.width - borders.right.width, draw_pos.y,
+                    borders.right.width, draw_pos.height);
+    }
+
+    void set_caption(const char *caption) override {
+    }
+
+    void set_base_url(const char *base_url) override {
+        baseUrl_ = base_url;
+    }
+
+    void link(const std::shared_ptr<litehtml::document> &doc, const litehtml::element::ptr &el) override {
+    }
+
+    void on_anchor_click(const char *url, const litehtml::element::ptr &el) override {
+    }
+
+    void on_mouse_event(const litehtml::element::ptr &el, litehtml::mouse_event event) override {
+    }
+
+    void set_cursor(const char *cursor) override {
+    }
+
+    void transform_text(litehtml::string &text, litehtml::text_transform tt) override {
+        switch (tt) {
+            case litehtml::text_transform_uppercase:
+                std::ranges::transform(text, text.begin(),
+                                       [](unsigned char c) { return std::toupper(c); });
+                break;
+            case litehtml::text_transform_lowercase:
+                std::ranges::transform(text, text.begin(),
+                                       [](unsigned char c) { return std::tolower(c); });
+                break;
+            default:
+                break;
+        }
+    }
+
+    void import_css(litehtml::string &text, const litehtml::string &url, litehtml::string &baseurl) override {
+    }
+
+    void set_clip(const litehtml::position &pos, const litehtml::border_radiuses &bdr_radius) override {
+        auto canvas = reinterpret_cast<SkCanvas *>(get_hdc());
+        canvas->save();
+        canvas->clipRect(SkRect::MakeXYWH(pos.x, pos.y, pos.width, pos.height));
+    }
+
+    void del_clip() override {
+        auto canvas = reinterpret_cast<SkCanvas *>(get_hdc());
+        canvas->restore();
+    }
+
+    void get_viewport(litehtml::position &viewport) const override {
+        viewport.x = 0;
+        viewport.y = 0;
+        viewport.width = width_;
+        viewport.height = height_;
+    }
+
+    litehtml::element::ptr create_element(const char *tag_name, const litehtml::string_map &attributes,
+                                          const std::shared_ptr<litehtml::document> &doc) override {
+        return std::make_shared<litehtml::html_tag>(doc);
+    }
+
+    void get_media_features(litehtml::media_features &media) const override {
+        media.type = litehtml::media_type_screen;
+        media.width = width_;
+        media.height = height_;
+        media.device_width = width_;
+        media.device_height = height_;
+        media.color = 8;
+        media.monochrome = 0;
+        media.color_index = 0;
+        media.resolution = 96;
+    }
+
+    void get_language(litehtml::string &language, litehtml::string &culture) const override {
+        language = "en";
+        culture = "en-US";
+    }
+
+    virtual litehtml::uint_ptr get_hdc() const = 0;
+};
+
+class AppDocumentContainer : public DocumentContainer {
+    SkCanvas *canvas_ = nullptr;
+
+public:
+    void setCanvas(SkCanvas *canvas) {
+        canvas_ = canvas;
+    }
+
+    litehtml::uint_ptr get_hdc() const override {
+        return reinterpret_cast<litehtml::uint_ptr>(canvas_);
+    }
+};
+
 struct App {
     VkAllocationCallbacks *allocator = nullptr;
 
@@ -83,6 +471,9 @@ struct App {
     std::unique_ptr<skgpu::graphite::Context> context_;
     std::unique_ptr<skgpu::graphite::Recorder> recorder_;
 
+    AppDocumentContainer container;
+    std::shared_ptr<litehtml::document> doc;
+
     struct Frame {
         VkSemaphore acquire = VK_NULL_HANDLE;
         VkSemaphore signal = VK_NULL_HANDLE;
@@ -94,7 +485,6 @@ struct App {
     std::vector<sk_sp<SkSurface> > surfaces;
     int frameIdx = 0;
     uint32_t currentImage = 0;
-    uint64_t presentID = 0;
 
     App() = default;
 
@@ -170,8 +560,8 @@ struct App {
 
         vkb::SwapchainBuilder swapchainBuilder(device_);
         swapchainBuilder
-            .set_create_flags(VK_SWAPCHAIN_CREATE_DEFERRED_MEMORY_ALLOCATION_BIT_KHR)
-            .set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
+                .set_create_flags(VK_SWAPCHAIN_CREATE_DEFERRED_MEMORY_ALLOCATION_BIT_KHR)
+                .set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
         swapchain_ = chkVkb(swapchainBuilder.build());
         swapchainImages_ = chkVkb(swapchain_.get_images());
 
@@ -207,10 +597,6 @@ struct App {
             VkSemaphoreCreateInfo sci{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
             chk(vk_.createSemaphore(&sci, allocator, &f.acquire));
             chk(vk_.createSemaphore(&sci, allocator, &f.signal));
-            VkFenceCreateInfo fci{
-                .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-                .flags = VK_FENCE_CREATE_SIGNALED_BIT,
-            };
             VkFenceCreateInfo pfci{
                 .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
             };
@@ -228,6 +614,47 @@ struct App {
 
         rebuildSurfaces();
 
+        const char *html = R"(
+            <html>
+            <head>
+            <style>
+                body {
+                    background-color: #f0f0f0;
+                    font-family: sans-serif;
+                    padding: 20px;
+                }
+                .card {
+                    background-color: white;
+                    border: 1px solid #ccc;
+                    padding: 20px;
+                    border-top-left-radius: 10px;
+                }
+                h1 {
+                    color: #333;
+                }
+                p {
+                    color: #666;
+                }
+            </style>
+            </head>
+            <body>
+                <div class="card">
+                    <h1>Hello from litehtml!</h1>
+                    <p>This is a test of <b>litehtml</b> rendering using <b>Skia Graphite</b> and <b>Vulkan</b>.</p>
+                    <ul>
+                        <li>Vulkan 1.4</li>
+                        <li>SDL 3</li>
+                        <li>Skia Graphite</li>
+                        <li>litehtml</li>
+                    </ul>
+                </div>
+            </body>
+            </html>
+        )";
+
+        doc = litehtml::document::createFromString(html, &container);
+        container.set_size(swapchain_.extent.width, swapchain_.extent.height);
+
         chkSDL(SDL_ShowWindow(window_));
         return SDL_APP_CONTINUE;
     }
@@ -236,9 +663,6 @@ struct App {
         if (!context_) return SDL_APP_CONTINUE;
 
         auto &frame = frames[frameIdx];
-
-        static int frameCount = 0;
-        if (++frameCount % 60 == 1) SDL_Log("Frame %d", frameCount);
 
         if (frame.presentPending) {
             chk(vk_.waitForFences(1, &frame.presentFence, VK_TRUE, UINT64_MAX));
@@ -256,15 +680,18 @@ struct App {
         chk(acqRes);
         currentImage = nextImage;
 
-        float t = (SDL_GetTicks() % 3000) / 3000.0f;
         auto canvas = surfaces[currentImage]->getCanvas();
+
+        container.setCanvas(canvas);
+        container.set_size(swapchain_.extent.width, swapchain_.extent.height);
+        doc->render(swapchain_.extent.width);
+
         SkPaint paint;
-        paint.setColor(SkColor4f{t, 1 - t, 0.5f, 1});
+        paint.setColor(SkColors::kWhite);
         canvas->drawPaint(paint);
-        // Draw a simple shape to verify Graphite rendering
-        SkPaint rectPaint;
-        rectPaint.setColor(SkColors::kWhite);
-        canvas->drawRect({100, 100, 200, 200}, rectPaint);
+
+        litehtml::position clip(0, 0, swapchain_.extent.width, swapchain_.extent.height);
+        doc->draw(reinterpret_cast<litehtml::uint_ptr>(canvas), 0, 0, &clip);
 
         auto recording = recorder_->snap();
         if (!recording) {
@@ -309,7 +736,8 @@ struct App {
         if (presRes == VK_ERROR_OUT_OF_DATE_KHR || presRes == VK_SUBOPTIMAL_KHR) {
             chk(vk_.resetFences(1, &frame.presentFence));
             rebuildSwapchain();
-        } else if (presRes == VK_ERROR_OUT_OF_HOST_MEMORY || presRes == VK_ERROR_OUT_OF_DEVICE_MEMORY || presRes == VK_ERROR_DEVICE_LOST) {
+        } else if (presRes == VK_ERROR_OUT_OF_HOST_MEMORY || presRes == VK_ERROR_OUT_OF_DEVICE_MEMORY || presRes ==
+                   VK_ERROR_DEVICE_LOST) {
             chk(vk_.resetFences(1, &frame.presentFence));
             chk(presRes);
         } else {
@@ -340,7 +768,7 @@ struct App {
         context_->submit(skgpu::graphite::SyncToCpu::kYes);
         for (auto &f: frames) {
             if (f.presentPending) {
-                vk_.waitForFences(1, &f.presentFence, VK_TRUE, UINT64_MAX);
+                chk(vk_.waitForFences(1, &f.presentFence, VK_TRUE, UINT64_MAX));
             }
             if (f.acquire != VK_NULL_HANDLE) vk_.destroySemaphore(f.acquire, allocator);
             if (f.signal != VK_NULL_HANDLE) vk_.destroySemaphore(f.signal, allocator);
@@ -363,8 +791,8 @@ private:
         // Wait for any pending present fences instead of a full device wait
         for (auto &f: frames) {
             if (f.presentPending) {
-                vk_.waitForFences(1, &f.presentFence, VK_TRUE, UINT64_MAX);
-                vk_.resetFences(1, &f.presentFence);
+                chk(vk_.waitForFences(1, &f.presentFence, VK_TRUE, UINT64_MAX));
+                chk(vk_.resetFences(1, &f.presentFence));
                 f.presentPending = false;
             }
         }
@@ -373,9 +801,9 @@ private:
 
         vkb::SwapchainBuilder swapchainBuilder(device_);
         swapchainBuilder
-            .set_old_swapchain(old)
-            .set_create_flags(VK_SWAPCHAIN_CREATE_DEFERRED_MEMORY_ALLOCATION_BIT_KHR)
-            .set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
+                .set_old_swapchain(old)
+                .set_create_flags(VK_SWAPCHAIN_CREATE_DEFERRED_MEMORY_ALLOCATION_BIT_KHR)
+                .set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
         auto newSwapchain = chkVkb(swapchainBuilder.build());
         vk_.destroySwapchainKHR(old, allocator);
         swapchain_ = newSwapchain;

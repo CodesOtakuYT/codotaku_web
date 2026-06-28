@@ -93,22 +93,22 @@ if (skia_ADDED)
         if (NOT EXISTS "${SKIA_LIB}")
             message(STATUS "Building Skia (${SKIA_CFG})...")
             execute_process(
-                COMMAND "${skia_SOURCE_DIR}/bin/gn" gen "${SKIA_OUT_DIR}"
+                    COMMAND "${skia_SOURCE_DIR}/bin/gn" gen "${SKIA_OUT_DIR}"
                     "--args=${SKIA_GN_ARGS}"
                     "--root=${skia_SOURCE_DIR}"
-                WORKING_DIRECTORY "${skia_SOURCE_DIR}"
-                RESULT_VARIABLE GN_RESULT
-                OUTPUT_VARIABLE GN_OUT
-                ERROR_VARIABLE GN_OUT
+                    WORKING_DIRECTORY "${skia_SOURCE_DIR}"
+                    RESULT_VARIABLE GN_RESULT
+                    OUTPUT_VARIABLE GN_OUT
+                    ERROR_VARIABLE GN_OUT
             )
             if (NOT GN_RESULT EQUAL 0)
                 message(FATAL_ERROR "gn gen (${SKIA_CFG}) failed: ${GN_OUT}")
             endif ()
             execute_process(
-                COMMAND ninja -C "${SKIA_OUT_DIR}" skia
-                RESULT_VARIABLE NINJA_RESULT
-                OUTPUT_VARIABLE NINJA_OUT
-                ERROR_VARIABLE NINJA_OUT
+                    COMMAND ninja -C "${SKIA_OUT_DIR}" skia
+                    RESULT_VARIABLE NINJA_RESULT
+                    OUTPUT_VARIABLE NINJA_OUT
+                    ERROR_VARIABLE NINJA_OUT
             )
             if (NOT NINJA_RESULT EQUAL 0)
                 message(FATAL_ERROR "ninja (${SKIA_CFG}) failed: ${NINJA_OUT}")
@@ -121,13 +121,15 @@ if (skia_ADDED)
     add_library(Skia::Skia STATIC IMPORTED GLOBAL)
     target_include_directories(Skia::Skia INTERFACE "${skia_SOURCE_DIR}")
     set_target_properties(Skia::Skia PROPERTIES
-        IMPORTED_LOCATION_DEBUG "${CMAKE_CURRENT_BINARY_DIR}/skia-build/Debug/out/Release/${CMAKE_STATIC_LIBRARY_PREFIX}skia${CMAKE_STATIC_LIBRARY_SUFFIX}"
-        IMPORTED_LOCATION_RELEASE "${CMAKE_CURRENT_BINARY_DIR}/skia-build/Release/out/Release/${CMAKE_STATIC_LIBRARY_PREFIX}skia${CMAKE_STATIC_LIBRARY_SUFFIX}"
-        IMPORTED_LOCATION_RELWITHDEBINFO "${CMAKE_CURRENT_BINARY_DIR}/skia-build/Release/out/Release/${CMAKE_STATIC_LIBRARY_PREFIX}skia${CMAKE_STATIC_LIBRARY_SUFFIX}"
-        IMPORTED_LOCATION_MINSIZEREL "${CMAKE_CURRENT_BINARY_DIR}/skia-build/Release/out/Release/${CMAKE_STATIC_LIBRARY_PREFIX}skia${CMAKE_STATIC_LIBRARY_SUFFIX}"
-        IMPORTED_CONFIGURATIONS "Debug;Release;RelWithDebInfo;MinSizeRel"
+            IMPORTED_LOCATION_DEBUG "${CMAKE_CURRENT_BINARY_DIR}/skia-build/Debug/out/Release/${CMAKE_STATIC_LIBRARY_PREFIX}skia${CMAKE_STATIC_LIBRARY_SUFFIX}"
+            IMPORTED_LOCATION_RELEASE "${CMAKE_CURRENT_BINARY_DIR}/skia-build/Release/out/Release/${CMAKE_STATIC_LIBRARY_PREFIX}skia${CMAKE_STATIC_LIBRARY_SUFFIX}"
+            IMPORTED_LOCATION_RELWITHDEBINFO "${CMAKE_CURRENT_BINARY_DIR}/skia-build/Release/out/Release/${CMAKE_STATIC_LIBRARY_PREFIX}skia${CMAKE_STATIC_LIBRARY_SUFFIX}"
+            IMPORTED_LOCATION_MINSIZEREL "${CMAKE_CURRENT_BINARY_DIR}/skia-build/Release/out/Release/${CMAKE_STATIC_LIBRARY_PREFIX}skia${CMAKE_STATIC_LIBRARY_SUFFIX}"
+            IMPORTED_CONFIGURATIONS "Debug;Release;RelWithDebInfo;MinSizeRel"
     )
 endif ()
 
+CPMAddPackage("gh:litehtml/litehtml@0.10")
+
 add_executable(codotaku_web main.cpp)
-target_link_libraries(codotaku_web PRIVATE Vulkan::Headers SDL3::SDL3-static vk-bootstrap::vk-bootstrap Skia::Skia)
+target_link_libraries(codotaku_web PRIVATE Vulkan::Headers SDL3::SDL3-static vk-bootstrap::vk-bootstrap Skia::Skia litehtml)
