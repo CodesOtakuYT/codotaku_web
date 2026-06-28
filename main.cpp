@@ -86,6 +86,8 @@ struct App {
         VkSemaphore acquire = VK_NULL_HANDLE;
         VkSemaphore signal = VK_NULL_HANDLE;
         VkFence submitFence = VK_NULL_HANDLE;
+        VkFence presentFence = VK_NULL_HANDLE;
+        bool presentPending = false;
     };
 
     std::vector<Frame> frames;
@@ -117,6 +119,9 @@ struct App {
         for (auto instanceExtension: instanceExtensions)
             instanceBuilder.enable_extension(instanceExtension);
 
+        instanceBuilder.enable_extension("VK_KHR_get_surface_capabilities2");
+        instanceBuilder.enable_extension("VK_EXT_surface_maintenance1");
+
         instance_ = chkVkb(instanceBuilder.build());
         vkInstance_ = instance_.make_table();
 
@@ -127,6 +132,26 @@ struct App {
         chkSDL(SDL_Vulkan_CreateSurface(window_, instance_.instance, allocator, &surface_));
 
         vkb::PhysicalDeviceSelector physicalDeviceSelector(instance_, surface_);
+        physicalDeviceSelector.add_required_extension("VK_EXT_swapchain_maintenance1");
+        physicalDeviceSelector.add_required_extension("VK_EXT_present_timing");
+        physicalDeviceSelector.add_required_extension("VK_KHR_present_mode_fifo_latest_ready");
+
+        VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maint1{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR,
+            .swapchainMaintenance1 = VK_TRUE,
+        };
+        physicalDeviceSelector.add_required_extension_features(maint1);
+        VkPhysicalDevicePresentTimingFeaturesEXT presentTiming{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT,
+            .presentTiming = VK_TRUE,
+        };
+        physicalDeviceSelector.add_required_extension_features(presentTiming);
+        VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR fifoLr{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
+            .presentModeFifoLatestReady = VK_TRUE,
+        };
+        physicalDeviceSelector.add_required_extension_features(fifoLr);
+
         auto physicalDeviceResult = physicalDeviceSelector.select();
         physicalDevice_ = chkVkb(physicalDeviceResult);
 
@@ -141,7 +166,21 @@ struct App {
         graphicsQueueIndex_ = graphicsQueueIndex;
         presentQueueIndex_ = presentQueueIndex;
 
+        VkPresentModeKHR presentModes[3] = {
+            VK_PRESENT_MODE_FIFO_KHR,
+            VK_PRESENT_MODE_MAILBOX_KHR,
+            VK_PRESENT_MODE_FIFO_LATEST_READY_KHR,
+        };
+        VkSwapchainPresentModesCreateInfoKHR presentModesCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR,
+            .presentModeCount = 3,
+            .pPresentModes = presentModes,
+        };
+
         vkb::SwapchainBuilder swapchainBuilder(device_);
+        swapchainBuilder
+            .set_create_flags(VK_SWAPCHAIN_CREATE_DEFERRED_MEMORY_ALLOCATION_BIT_KHR)
+            .add_pNext(&presentModesCreateInfo);
         swapchain_ = chkVkb(swapchainBuilder.build());
         swapchainImages_ = chkVkb(swapchain_.get_images());
 
@@ -182,6 +221,10 @@ struct App {
                 .flags = VK_FENCE_CREATE_SIGNALED_BIT,
             };
             chk(vk_.createFence(&fci, allocator, &f.submitFence));
+            VkFenceCreateInfo pfci{
+                .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            };
+            chk(vk_.createFence(&pfci, allocator, &f.presentFence));
         }
 
         skgpu::graphite::ContextOptions contextOptions;
@@ -207,6 +250,13 @@ struct App {
         // CPU pacing: wait for this frame slot's previous submission to complete
         chk(vk_.waitForFences(1, &frame.submitFence, VK_TRUE, UINT64_MAX));
         chk(vk_.resetFences(1, &frame.submitFence));
+
+        // Wait for previous present fence (presentation engine done with prior frame)
+        if (frame.presentPending) {
+            chk(vk_.waitForFences(1, &frame.presentFence, VK_TRUE, UINT64_MAX));
+            chk(vk_.resetFences(1, &frame.presentFence));
+            frame.presentPending = false;
+        }
 
         // Acquire next swapchain image
         uint32_t nextImage;
@@ -254,9 +304,15 @@ struct App {
         context_->insertRecording(info);
         context_->submit(skgpu::graphite::SyncToCpu::kNo);
 
-        // Present
+        // Present with swapchain-maintenance1 present fence
+        VkSwapchainPresentFenceInfoKHR presentFenceInfo{
+            .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR,
+            .swapchainCount = 1,
+            .pFences = &frame.presentFence,
+        };
         VkPresentInfoKHR presentInfo{
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .pNext = &presentFenceInfo,
             .waitSemaphoreCount = 1,
             .pWaitSemaphores = &frame.signal,
             .swapchainCount = 1,
@@ -265,9 +321,14 @@ struct App {
         };
         auto presRes = vk_.queuePresentKHR(presentQueue_, &presentInfo);
         if (presRes == VK_ERROR_OUT_OF_DATE_KHR || presRes == VK_SUBOPTIMAL_KHR) {
+            chk(vk_.resetFences(1, &frame.presentFence));
             rebuildSwapchain();
+        } else if (presRes == VK_ERROR_OUT_OF_HOST_MEMORY || presRes == VK_ERROR_OUT_OF_DEVICE_MEMORY || presRes == VK_ERROR_DEVICE_LOST) {
+            chk(vk_.resetFences(1, &frame.presentFence));
+            chk(presRes);
         } else {
             chk(presRes);
+            frame.presentPending = true;
         }
 
         frameIdx = (frameIdx + 1) % MAX_FRAMES;
@@ -292,9 +353,13 @@ struct App {
         surfaces.clear();
         context_->submit(skgpu::graphite::SyncToCpu::kYes);
         for (auto &f: frames) {
+            if (f.presentPending) {
+                vk_.waitForFences(1, &f.presentFence, VK_TRUE, UINT64_MAX);
+            }
             if (f.acquire != VK_NULL_HANDLE) vk_.destroySemaphore(f.acquire, allocator);
             if (f.signal != VK_NULL_HANDLE) vk_.destroySemaphore(f.signal, allocator);
             if (f.submitFence != VK_NULL_HANDLE) vk_.destroyFence(f.submitFence, allocator);
+            if (f.presentFence != VK_NULL_HANDLE) vk_.destroyFence(f.presentFence, allocator);
         }
         frames.clear();
         vkb::destroy_swapchain(swapchain_);
@@ -309,11 +374,33 @@ struct App {
 private:
     void rebuildSwapchain() {
         surfaces.clear();
-        context_->submit(skgpu::graphite::SyncToCpu::kYes);
+
+        // Wait for any pending present fences instead of a full device wait
+        for (auto &f: frames) {
+            if (f.presentPending) {
+                vk_.waitForFences(1, &f.presentFence, VK_TRUE, UINT64_MAX);
+                vk_.resetFences(1, &f.presentFence);
+                f.presentPending = false;
+            }
+        }
 
         VkSwapchainKHR old = swapchain_.swapchain;
+
         vkb::SwapchainBuilder swapchainBuilder(device_);
-        swapchainBuilder.set_old_swapchain(old);
+        VkPresentModeKHR presentModes[3] = {
+            VK_PRESENT_MODE_FIFO_KHR,
+            VK_PRESENT_MODE_MAILBOX_KHR,
+            VK_PRESENT_MODE_FIFO_LATEST_READY_KHR,
+        };
+        VkSwapchainPresentModesCreateInfoKHR presentModesCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR,
+            .presentModeCount = 3,
+            .pPresentModes = presentModes,
+        };
+        swapchainBuilder
+            .set_old_swapchain(old)
+            .set_create_flags(VK_SWAPCHAIN_CREATE_DEFERRED_MEMORY_ALLOCATION_BIT_KHR)
+            .add_pNext(&presentModesCreateInfo);
         auto newSwapchain = chkVkb(swapchainBuilder.build());
         vk_.destroySwapchainKHR(old, allocator);
         swapchain_ = newSwapchain;
