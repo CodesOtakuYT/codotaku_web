@@ -26,7 +26,13 @@
 #include "include/gpu/graphite/ContextOptions.h"
 #include "include/gpu/graphite/BackendTexture.h"
 #include "include/gpu/graphite/Surface.h"
+#include "include/gpu/graphite/GraphiteTypes.h"
+#include "include/gpu/graphite/BackendSemaphore.h"
+#include "include/gpu/graphite/Recording.h"
+#include "include/gpu/MutableTextureState.h"
+#include "include/gpu/vk/VulkanMutableTextureState.h"
 #include "include/core/SkColorSpace.h"
+#include "include/core/SkCanvas.h"
 
 auto chkSDL(bool result, std::source_location loc = {}) {
     if (!result) {
@@ -58,9 +64,10 @@ static auto chk(VkResult res, std::source_location loc = {}) -> void {
 static constexpr int MAX_FRAMES = 2;
 
 struct App {
-    VkAllocationCallbacks *allocator;
+    VkAllocationCallbacks *allocator = nullptr;
 
     vkb::Instance instance_;
+    vkb::InstanceDispatchTable vkInstance_;
     SDL_Window *window_;
     VkSurfaceKHR surface_;
     vkb::PhysicalDevice physicalDevice_;
@@ -78,12 +85,13 @@ struct App {
     struct Frame {
         VkSemaphore acquire = VK_NULL_HANDLE;
         VkSemaphore signal = VK_NULL_HANDLE;
+        VkFence submitFence = VK_NULL_HANDLE;
     };
 
     std::vector<Frame> frames;
     std::vector<sk_sp<SkSurface> > surfaces;
     int frameIdx = 0;
-    int currentImage = -1;
+    uint32_t currentImage = 0;
     uint64_t presentID = 0;
 
     App() = default;
@@ -110,6 +118,7 @@ struct App {
             instanceBuilder.enable_extension(instanceExtension);
 
         instance_ = chkVkb(instanceBuilder.build());
+        vkInstance_ = instance_.make_table();
 
         window_ = SDL_CreateWindow("Codotaku Web", 800, 600,
                                    SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN);
@@ -168,6 +177,11 @@ struct App {
             VkSemaphoreCreateInfo sci{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
             chk(vk_.createSemaphore(&sci, allocator, &f.acquire));
             chk(vk_.createSemaphore(&sci, allocator, &f.signal));
+            VkFenceCreateInfo fci{
+                .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+            };
+            chk(vk_.createFence(&fci, allocator, &f.submitFence));
         }
 
         skgpu::graphite::ContextOptions contextOptions;
@@ -186,6 +200,77 @@ struct App {
     }
 
     auto Iterate() -> SDL_AppResult {
+        if (!context_) return SDL_APP_CONTINUE;
+
+        auto &frame = frames[frameIdx];
+
+        // CPU pacing: wait for this frame slot's previous submission to complete
+        chk(vk_.waitForFences(1, &frame.submitFence, VK_TRUE, UINT64_MAX));
+        chk(vk_.resetFences(1, &frame.submitFence));
+
+        // Acquire next swapchain image
+        uint32_t nextImage;
+        auto acqRes = vk_.acquireNextImageKHR(
+            swapchain_.swapchain, UINT64_MAX, frame.acquire, VK_NULL_HANDLE, &nextImage);
+        if (acqRes == VK_ERROR_OUT_OF_DATE_KHR) {
+            rebuildSwapchain();
+            return SDL_APP_CONTINUE;
+        }
+        chk(acqRes);
+        currentImage = nextImage;
+
+        // Draw: simple animated clear
+        static float hue = 0.0f;
+        hue += 0.01f;
+        if (hue > 1.0f) hue -= 1.0f;
+        auto canvas = surfaces[currentImage]->getCanvas();
+        SkScalar hsv[3] = {hue, 1.0f, 1.0f};
+        canvas->clear(SkColor4f::FromColor(SkHSVToColor(hsv)));
+
+        // Snap recorder and submit recording to GPU
+        auto recording = recorder_->snap();
+        if (!recording) {
+            SDL_LogError(SDL_LOG_CATEGORY_ERROR, "snap() failed");
+            return SDL_APP_CONTINUE;
+        }
+
+        skgpu::graphite::InsertRecordingInfo info{};
+        info.fRecording = recording.get();
+        info.fTargetSurface = surfaces[currentImage].get();
+
+        auto presentState = skgpu::MutableTextureStates::MakeVulkan(
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, presentQueueIndex_);
+        info.fTargetTextureState = &presentState;
+
+        info.fNumWaitSemaphores = 1;
+        auto backendAcquire = skgpu::graphite::BackendSemaphores::MakeVulkan(frame.acquire);
+        info.fWaitSemaphores = &backendAcquire;
+
+        // Signal semaphore for present synchronization
+        info.fNumSignalSemaphores = 1;
+        auto backendSignal = skgpu::graphite::BackendSemaphores::MakeVulkan(frame.signal);
+        info.fSignalSemaphores = &backendSignal;
+
+        context_->insertRecording(info);
+        context_->submit(skgpu::graphite::SyncToCpu::kNo);
+
+        // Present
+        VkPresentInfoKHR presentInfo{
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &frame.signal,
+            .swapchainCount = 1,
+            .pSwapchains = &swapchain_.swapchain,
+            .pImageIndices = &currentImage,
+        };
+        auto presRes = vk_.queuePresentKHR(presentQueue_, &presentInfo);
+        if (presRes == VK_ERROR_OUT_OF_DATE_KHR || presRes == VK_SUBOPTIMAL_KHR) {
+            rebuildSwapchain();
+        } else {
+            chk(presRes);
+        }
+
+        frameIdx = (frameIdx + 1) % MAX_FRAMES;
         return SDL_APP_CONTINUE;
     }
 
@@ -193,15 +278,50 @@ struct App {
         switch (event->type) {
             case SDL_EVENT_QUIT:
                 return SDL_APP_SUCCESS;
+            case SDL_EVENT_WINDOW_RESIZED:
+            case SDL_EVENT_WINDOW_EXPOSED:
+                rebuildSwapchain();
+                return SDL_APP_CONTINUE;
             default:
                 return SDL_APP_CONTINUE;
         }
     }
 
     auto Quit(SDL_AppResult result) -> void {
+        if (!context_) return;
+        surfaces.clear();
+        context_->submit(skgpu::graphite::SyncToCpu::kYes);
+        for (auto &f: frames) {
+            if (f.acquire != VK_NULL_HANDLE) vk_.destroySemaphore(f.acquire, allocator);
+            if (f.signal != VK_NULL_HANDLE) vk_.destroySemaphore(f.signal, allocator);
+            if (f.submitFence != VK_NULL_HANDLE) vk_.destroyFence(f.submitFence, allocator);
+        }
+        frames.clear();
+        vkb::destroy_swapchain(swapchain_);
+        recorder_.reset();
+        context_.reset();
+        vkb::destroy_device(device_);
+        vkInstance_.destroySurfaceKHR(surface_, allocator);
+        SDL_DestroyWindow(window_);
+        vkb::destroy_instance(instance_);
     }
 
 private:
+    void rebuildSwapchain() {
+        surfaces.clear();
+        context_->submit(skgpu::graphite::SyncToCpu::kYes);
+
+        VkSwapchainKHR old = swapchain_.swapchain;
+        vkb::SwapchainBuilder swapchainBuilder(device_);
+        swapchainBuilder.set_old_swapchain(old);
+        auto newSwapchain = chkVkb(swapchainBuilder.build());
+        vk_.destroySwapchainKHR(old, allocator);
+        swapchain_ = newSwapchain;
+
+        swapchainImages_ = chkVkb(swapchain_.get_images());
+        rebuildSurfaces();
+    }
+
     void rebuildSurfaces() {
         surfaces.clear();
         for (auto img: swapchainImages_) {
