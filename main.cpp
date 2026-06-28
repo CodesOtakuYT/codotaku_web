@@ -1,5 +1,7 @@
 #define SDL_MAIN_USE_CALLBACKS 1
 #define VK_NO_PROTOTYPES
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
 
 #include <vulkan/vulkan.h>
 
@@ -32,6 +34,9 @@
 #include "litehtml/document.h"
 #include "litehtml/document_container.h"
 #include "litehtml/html_tag.h"
+#include <curl/curl.h>
+#include <string>
+#include <vector>
 
 auto chkSDL(bool result, std::source_location loc = {}) {
     if (!result) {
@@ -60,6 +65,55 @@ static auto chk(VkResult res, std::source_location loc = {}) -> void {
     }
 }
 
+static auto curlWriteCb(char *ptr, size_t size, size_t nmemb, void *userdata) -> size_t {
+    auto *out = static_cast<std::string *>(userdata);
+    out->append(ptr, size * nmemb);
+    return size * nmemb;
+}
+
+// Fetch a URL over HTTP(S) into out. Returns false on failure.
+static auto httpGet(const std::string &url, std::string &out) -> bool {
+    CURL *curl = curl_easy_init();
+    if (!curl) return false;
+    out.clear();
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "codotaku-web/0.0.1");
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        SDL_LogError(SDL_LOG_CATEGORY_ERROR, "curl failed for %s: %s", url.c_str(), curl_easy_strerror(res));
+    }
+    curl_easy_cleanup(curl);
+    return res == CURLE_OK;
+}
+
+// Resolve a possibly-relative reference against a base URL.
+static auto resolveUrl(const std::string &base, const std::string &rel) -> std::string {
+    if (rel.empty()) return base;
+    if (rel.find("://") != std::string::npos) return rel; // already absolute
+    if (rel.rfind("//", 0) == 0) {
+        // protocol-relative
+        auto schemeEnd = base.find("://");
+        std::string scheme = schemeEnd != std::string::npos ? base.substr(0, schemeEnd) : "https";
+        return scheme + ":" + rel;
+    }
+    auto schemeEnd = base.find("://");
+    if (schemeEnd == std::string::npos) return rel;
+    auto hostStart = schemeEnd + 3;
+    auto pathStart = base.find('/', hostStart);
+    std::string origin = pathStart == std::string::npos ? base : base.substr(0, pathStart);
+    if (rel[0] == '/') return origin + rel; // root-relative
+    // document-relative: take directory of base path
+    std::string dir = pathStart == std::string::npos
+                          ? origin + "/"
+                          : base.substr(0, base.find_last_of('/') + 1);
+    return dir + rel;
+}
+
 static constexpr int MAX_FRAMES = 2;
 
 #include <include/core/SkFontMgr.h>
@@ -77,6 +131,7 @@ struct SkiaFont {
 
 class DocumentContainer : public litehtml::document_container {
     std::string baseUrl_;
+    std::string pageUrl_;
     sk_sp<SkFontMgr> m_fontMgr;
     std::map<std::string, sk_sp<SkImage> > images_;
 
@@ -84,9 +139,21 @@ protected:
     int width_ = 800;
     int height_ = 600;
 
+    // Resolve a reference against the most specific base available.
+    std::string makeAbsolute(const std::string &src, const std::string &baseurl) const {
+        const std::string &base = !baseurl.empty()
+                                      ? baseurl
+                                      : (!baseUrl_.empty() ? baseUrl_ : pageUrl_);
+        return resolveUrl(base, src);
+    }
+
 public:
     DocumentContainer() {
         m_fontMgr = SkFontMgr_New_DirectWrite();
+    }
+
+    void set_page_url(const std::string &url) {
+        pageUrl_ = url;
     }
 
     void set_size(int w, int h) {
@@ -205,21 +272,20 @@ public:
     }
 
     void load_image(const char *src, const char *baseurl, bool redraw_on_ready) override {
-        if (images_.contains(src)) return;
+        std::string url = makeAbsolute(src, baseurl ? baseurl : "");
+        if (images_.contains(url)) return;
 
-        size_t size;
-        void *data = SDL_LoadFile(src, &size);
-        if (data) {
-            auto skData = SkData::MakeWithCopy(data, size);
-            SDL_free(data);
+        std::string data;
+        if (httpGet(url, data) && !data.empty()) {
+            auto skData = SkData::MakeWithCopy(data.data(), data.size());
             auto image = SkImages::DeferredFromEncodedData(skData);
             if (image)
-                images_[src] = image;
+                images_[url] = image;
         }
     }
 
     void get_image_size(const char *src, const char *baseurl, litehtml::size &sz) override {
-        auto it = images_.find(src);
+        auto it = images_.find(makeAbsolute(src, baseurl ? baseurl : ""));
         if (it != images_.end()) {
             sz.width = it->second->width();
             sz.height = it->second->height();
@@ -232,7 +298,7 @@ public:
     void draw_image(litehtml::uint_ptr hdc, const litehtml::background_layer &layer, const std::string &url,
                     const std::string &base_url) override {
         auto canvas = reinterpret_cast<SkCanvas *>(hdc);
-        auto it = images_.find(url);
+        auto it = images_.find(makeAbsolute(url, base_url));
         if (it != images_.end()) {
             canvas->drawImageRect(
                 it->second, SkRect::MakeXYWH(layer.border_box.x, layer.border_box.y, layer.border_box.width,
@@ -394,6 +460,12 @@ public:
     }
 
     void import_css(litehtml::string &text, const litehtml::string &url, litehtml::string &baseurl) override {
+        std::string abs = makeAbsolute(url, baseurl);
+        std::string data;
+        if (httpGet(abs, data)) {
+            text = data;
+            baseurl = abs; // resolve url()s inside the stylesheet relative to its location
+        }
     }
 
     void set_clip(const litehtml::position &pos, const litehtml::border_radiuses &bdr_radius) override {
@@ -489,6 +561,7 @@ struct App {
     App() = default;
 
     auto Init(std::span<char *> args) -> SDL_AppResult {
+        curl_global_init(CURL_GLOBAL_DEFAULT);
         chkSDL(SDL_SetAppMetadata("Codotaku Web", "0.0.1", "com.codotaku.web"));
         chkSDL(SDL_Init(SDL_INIT_VIDEO));
         chkSDL(SDL_Vulkan_LoadLibrary(nullptr));
@@ -614,45 +687,16 @@ struct App {
 
         rebuildSurfaces();
 
-        const char *html = R"(
-            <html>
-            <head>
-            <style>
-                body {
-                    background-color: #f0f0f0;
-                    font-family: sans-serif;
-                    padding: 20px;
-                }
-                .card {
-                    background-color: white;
-                    border: 1px solid #ccc;
-                    padding: 20px;
-                    border-top-left-radius: 10px;
-                }
-                h1 {
-                    color: #333;
-                }
-                p {
-                    color: #666;
-                }
-            </style>
-            </head>
-            <body>
-                <div class="card">
-                    <h1>Hello from litehtml!</h1>
-                    <p>This is a test of <b>litehtml</b> rendering using <b>Skia Graphite</b> and <b>Vulkan</b>.</p>
-                    <ul>
-                        <li>Vulkan 1.4</li>
-                        <li>SDL 3</li>
-                        <li>Skia Graphite</li>
-                        <li>litehtml</li>
-                    </ul>
-                </div>
-            </body>
-            </html>
-        )";
+        std::string url = args.size() > 1 ? args[1] : "https://example.com";
+        container.set_page_url(url);
 
-        doc = litehtml::document::createFromString(html, &container);
+        std::string html;
+        if (!httpGet(url, html) || html.empty()) {
+            SDL_LogError(SDL_LOG_CATEGORY_ERROR, "Failed to load %s", url.c_str());
+            html = "<html><body><h1>Failed to load page</h1></body></html>";
+        }
+
+        doc = litehtml::document::createFromString(html.c_str(), &container);
         container.set_size(swapchain_.extent.width, swapchain_.extent.height);
 
         chkSDL(SDL_ShowWindow(window_));
@@ -782,6 +826,7 @@ struct App {
         vkInstance_.destroySurfaceKHR(surface_, allocator);
         SDL_DestroyWindow(window_);
         vkb::destroy_instance(instance_);
+        curl_global_cleanup();
     }
 
 private:

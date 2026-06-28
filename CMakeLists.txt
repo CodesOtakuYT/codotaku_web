@@ -131,5 +131,23 @@ endif ()
 
 CPMAddPackage("gh:litehtml/litehtml@0.10")
 
+CPMAddPackage(
+        NAME curl
+        GIT_REPOSITORY https://github.com/curl/curl.git
+        GIT_TAG curl-8_11_1
+        OPTIONS
+        "BUILD_CURL_EXE OFF"
+        "BUILD_SHARED_LIBS OFF"
+        "BUILD_TESTING OFF"
+        "CURL_ENABLE_SSL ON"
+        "CURL_USE_SCHANNEL ON"
+        "CURL_USE_LIBPSL OFF"
+        "CURL_USE_LIBSSH2 OFF"
+        "USE_LIBIDN2 OFF"
+        "CURL_ZLIB OFF"
+        "CURL_BROTLI OFF"
+        "CURL_ZSTD OFF"
+)
+
 add_executable(codotaku_web main.cpp)
-target_link_libraries(codotaku_web PRIVATE Vulkan::Headers SDL3::SDL3-static vk-bootstrap::vk-bootstrap Skia::Skia litehtml)
+target_link_libraries(codotaku_web PRIVATE Vulkan::Headers SDL3::SDL3-static vk-bootstrap::vk-bootstrap Skia::Skia litehtml CURL::libcurl)
