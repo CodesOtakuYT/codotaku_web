@@ -9,6 +9,7 @@
 #include <SDL3/SDL_main.h>
 
 #include "SDL3/SDL_log.h"
+#include "SDL3/SDL_timer.h"
 #include "SDL3/SDL_vulkan.h"
 #include <include/gpu/vk/VulkanBackendContext.h>
 #include <include/gpu/vk/VulkanMemoryAllocator.h>
@@ -85,7 +86,6 @@ struct App {
     struct Frame {
         VkSemaphore acquire = VK_NULL_HANDLE;
         VkSemaphore signal = VK_NULL_HANDLE;
-        VkFence submitFence = VK_NULL_HANDLE;
         VkFence presentFence = VK_NULL_HANDLE;
         bool presentPending = false;
     };
@@ -134,6 +134,8 @@ struct App {
         vkb::PhysicalDeviceSelector physicalDeviceSelector(instance_, surface_);
         physicalDeviceSelector.add_required_extension("VK_EXT_swapchain_maintenance1");
         physicalDeviceSelector.add_required_extension("VK_EXT_present_timing");
+        physicalDeviceSelector.add_required_extension("VK_KHR_present_id2");
+        physicalDeviceSelector.add_required_extension("VK_KHR_calibrated_timestamps");
         physicalDeviceSelector.add_required_extension("VK_KHR_present_mode_fifo_latest_ready");
 
         VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maint1{
@@ -166,21 +168,10 @@ struct App {
         graphicsQueueIndex_ = graphicsQueueIndex;
         presentQueueIndex_ = presentQueueIndex;
 
-        VkPresentModeKHR presentModes[3] = {
-            VK_PRESENT_MODE_FIFO_KHR,
-            VK_PRESENT_MODE_MAILBOX_KHR,
-            VK_PRESENT_MODE_FIFO_LATEST_READY_KHR,
-        };
-        VkSwapchainPresentModesCreateInfoKHR presentModesCreateInfo{
-            .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR,
-            .presentModeCount = 3,
-            .pPresentModes = presentModes,
-        };
-
         vkb::SwapchainBuilder swapchainBuilder(device_);
         swapchainBuilder
             .set_create_flags(VK_SWAPCHAIN_CREATE_DEFERRED_MEMORY_ALLOCATION_BIT_KHR)
-            .add_pNext(&presentModesCreateInfo);
+            .set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
         swapchain_ = chkVkb(swapchainBuilder.build());
         swapchainImages_ = chkVkb(swapchain_.get_images());
 
@@ -220,7 +211,6 @@ struct App {
                 .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
                 .flags = VK_FENCE_CREATE_SIGNALED_BIT,
             };
-            chk(vk_.createFence(&fci, allocator, &f.submitFence));
             VkFenceCreateInfo pfci{
                 .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
             };
@@ -247,18 +237,15 @@ struct App {
 
         auto &frame = frames[frameIdx];
 
-        // CPU pacing: wait for this frame slot's previous submission to complete
-        chk(vk_.waitForFences(1, &frame.submitFence, VK_TRUE, UINT64_MAX));
-        chk(vk_.resetFences(1, &frame.submitFence));
+        static int frameCount = 0;
+        if (++frameCount % 60 == 1) SDL_Log("Frame %d", frameCount);
 
-        // Wait for previous present fence (presentation engine done with prior frame)
         if (frame.presentPending) {
             chk(vk_.waitForFences(1, &frame.presentFence, VK_TRUE, UINT64_MAX));
             chk(vk_.resetFences(1, &frame.presentFence));
             frame.presentPending = false;
         }
 
-        // Acquire next swapchain image
         uint32_t nextImage;
         auto acqRes = vk_.acquireNextImageKHR(
             swapchain_.swapchain, UINT64_MAX, frame.acquire, VK_NULL_HANDLE, &nextImage);
@@ -269,15 +256,16 @@ struct App {
         chk(acqRes);
         currentImage = nextImage;
 
-        // Draw: simple animated clear
-        static float hue = 0.0f;
-        hue += 0.01f;
-        if (hue > 1.0f) hue -= 1.0f;
+        float t = (SDL_GetTicks() % 3000) / 3000.0f;
         auto canvas = surfaces[currentImage]->getCanvas();
-        SkScalar hsv[3] = {hue, 1.0f, 1.0f};
-        canvas->clear(SkColor4f::FromColor(SkHSVToColor(hsv)));
+        SkPaint paint;
+        paint.setColor(SkColor4f{t, 1 - t, 0.5f, 1});
+        canvas->drawPaint(paint);
+        // Draw a simple shape to verify Graphite rendering
+        SkPaint rectPaint;
+        rectPaint.setColor(SkColors::kWhite);
+        canvas->drawRect({100, 100, 200, 200}, rectPaint);
 
-        // Snap recorder and submit recording to GPU
         auto recording = recorder_->snap();
         if (!recording) {
             SDL_LogError(SDL_LOG_CATEGORY_ERROR, "snap() failed");
@@ -296,7 +284,6 @@ struct App {
         auto backendAcquire = skgpu::graphite::BackendSemaphores::MakeVulkan(frame.acquire);
         info.fWaitSemaphores = &backendAcquire;
 
-        // Signal semaphore for present synchronization
         info.fNumSignalSemaphores = 1;
         auto backendSignal = skgpu::graphite::BackendSemaphores::MakeVulkan(frame.signal);
         info.fSignalSemaphores = &backendSignal;
@@ -304,7 +291,9 @@ struct App {
         context_->insertRecording(info);
         context_->submit(skgpu::graphite::SyncToCpu::kNo);
 
-        // Present with swapchain-maintenance1 present fence
+        static int dbgFrame = 0;
+        dbgFrame++;
+
         VkSwapchainPresentFenceInfoKHR presentFenceInfo{
             .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR,
             .swapchainCount = 1,
@@ -358,7 +347,6 @@ struct App {
             }
             if (f.acquire != VK_NULL_HANDLE) vk_.destroySemaphore(f.acquire, allocator);
             if (f.signal != VK_NULL_HANDLE) vk_.destroySemaphore(f.signal, allocator);
-            if (f.submitFence != VK_NULL_HANDLE) vk_.destroyFence(f.submitFence, allocator);
             if (f.presentFence != VK_NULL_HANDLE) vk_.destroyFence(f.presentFence, allocator);
         }
         frames.clear();
@@ -387,20 +375,10 @@ private:
         VkSwapchainKHR old = swapchain_.swapchain;
 
         vkb::SwapchainBuilder swapchainBuilder(device_);
-        VkPresentModeKHR presentModes[3] = {
-            VK_PRESENT_MODE_FIFO_KHR,
-            VK_PRESENT_MODE_MAILBOX_KHR,
-            VK_PRESENT_MODE_FIFO_LATEST_READY_KHR,
-        };
-        VkSwapchainPresentModesCreateInfoKHR presentModesCreateInfo{
-            .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR,
-            .presentModeCount = 3,
-            .pPresentModes = presentModes,
-        };
         swapchainBuilder
             .set_old_swapchain(old)
             .set_create_flags(VK_SWAPCHAIN_CREATE_DEFERRED_MEMORY_ALLOCATION_BIT_KHR)
-            .add_pNext(&presentModesCreateInfo);
+            .set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
         auto newSwapchain = chkVkb(swapchainBuilder.build());
         vk_.destroySwapchainKHR(old, allocator);
         swapchain_ = newSwapchain;
