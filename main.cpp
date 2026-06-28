@@ -291,9 +291,6 @@ struct App {
         context_->insertRecording(info);
         context_->submit(skgpu::graphite::SyncToCpu::kNo);
 
-        static int dbgFrame = 0;
-        dbgFrame++;
-
         VkSwapchainPresentFenceInfoKHR presentFenceInfo{
             .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR,
             .swapchainCount = 1,

@@ -5,13 +5,19 @@ set(CMAKE_CXX_STANDARD 26)
 
 set(CPM_SOURCE_CACHE "${CMAKE_CURRENT_SOURCE_DIR}/.cpm-cache" CACHE PATH "CPM source cache directory" FORCE)
 
-file(
-        DOWNLOAD
-        https://github.com/cpm-cmake/CPM.cmake/releases/download/v0.40.8/CPM.cmake
-        ${CMAKE_CURRENT_BINARY_DIR}/cmake/CPM.cmake
-        EXPECTED_HASH SHA256=78ba32abdf798bc616bab7c73aac32a17bbd7b06ad9e26a6add69de8f3ae4791
-)
-include(${CMAKE_CURRENT_BINARY_DIR}/cmake/CPM.cmake)
+set(CPM_DOWNLOAD_LOCATION "${CPM_SOURCE_CACHE}/CPM.cmake")
+if (NOT EXISTS "${CPM_DOWNLOAD_LOCATION}")
+    message(STATUS "Downloading CPM.cmake...")
+    file(
+            DOWNLOAD
+            https://github.com/cpm-cmake/CPM.cmake/releases/download/v0.40.8/CPM.cmake
+            "${CPM_DOWNLOAD_LOCATION}"
+            EXPECTED_HASH SHA256=78ba32abdf798bc616bab7c73aac32a17bbd7b06ad9e26a6add69de8f3ae4791
+    )
+else ()
+    message(STATUS "Using cached CPM.cmake")
+endif ()
+include("${CPM_DOWNLOAD_LOCATION}")
 
 CPMAddPackage(
         NAME SDL
@@ -30,67 +36,97 @@ CPMAddPackage(
 )
 
 if (skia_ADDED)
+    message(STATUS "Skia sources cached in ${skia_SOURCE_DIR}")
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
-    # Clean any stale externals to avoid git checkout conflicts on re-sync
-    set(SKIA_EXTERNALS_DIR "${skia_SOURCE_DIR}/third_party/externals")
-    if (EXISTS "${SKIA_EXTERNALS_DIR}")
-        file(REMOVE_RECURSE "${SKIA_EXTERNALS_DIR}")
-    endif ()
-
-    # git-sync-deps is inherently unreliable with multithreaded cloning
-    # hitting HTTP 429 rate limits from googlesource.com; retry up to 3 times.
-    set(SKIA_SYNC_DEPS_RETRIES 3)
-    set(SKIA_SYNC_SUCCESS FALSE)
-    foreach (SKIA_TRY RANGE ${SKIA_SYNC_DEPS_RETRIES})
-        execute_process(
-                COMMAND ${Python3_EXECUTABLE} tools/git-sync-deps
-                WORKING_DIRECTORY "${skia_SOURCE_DIR}"
-                RESULT_VARIABLE SKIA_GSD_RESULT
-        )
-        if (SKIA_GSD_RESULT EQUAL 0)
-            set(SKIA_SYNC_SUCCESS TRUE)
-            break()
+    set(SKIA_GSD_LOCK "${skia_SOURCE_DIR}/.git-sync-deps-done")
+    if (NOT EXISTS "${SKIA_GSD_LOCK}")
+        message(STATUS "git-sync-deps: fetching Skia third-party dependencies...")
+        set(SKIA_EXTERNALS_DIR "${skia_SOURCE_DIR}/third_party/externals")
+        if (EXISTS "${SKIA_EXTERNALS_DIR}")
+            file(REMOVE_RECURSE "${SKIA_EXTERNALS_DIR}")
         endif ()
-        message(STATUS "git-sync-deps failed (attempt ${SKIA_TRY}), retrying...")
-    endforeach ()
-    if (NOT SKIA_SYNC_SUCCESS)
-        message(FATAL_ERROR "git-sync-deps failed after ${SKIA_SYNC_DEPS_RETRIES} attempts")
-    endif ()
 
-    set(SKIA_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/skia-build")
-    set(SKIA_GN_OUTPUT_DIR "${SKIA_BINARY_DIR}/out/Release")
-    set(SKIA_LIB_OUTPUT "${SKIA_GN_OUTPUT_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}skia${CMAKE_STATIC_LIBRARY_SUFFIX}")
-
-    include(ExternalProject)
-
-    # Match Skia's runtime library to CMake's build type
-    if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-        set(SKIA_GN_EXTRA_ARGS "is_debug=true extra_cflags=[\"/MDd\"]")
+        set(SKIA_SYNC_DEPS_RETRIES 3)
+        set(SKIA_SYNC_SUCCESS FALSE)
+        foreach (SKIA_TRY RANGE ${SKIA_SYNC_DEPS_RETRIES})
+            execute_process(
+                    COMMAND ${Python3_EXECUTABLE} tools/git-sync-deps
+                    WORKING_DIRECTORY "${skia_SOURCE_DIR}"
+                    RESULT_VARIABLE SKIA_GSD_RESULT
+            )
+            if (SKIA_GSD_RESULT EQUAL 0)
+                set(SKIA_SYNC_SUCCESS TRUE)
+                break()
+            endif ()
+            message(STATUS "git-sync-deps failed (attempt ${SKIA_TRY}), retrying...")
+        endforeach ()
+        if (NOT SKIA_SYNC_SUCCESS)
+            message(FATAL_ERROR "git-sync-deps failed after ${SKIA_SYNC_DEPS_RETRIES} attempts")
+        endif ()
+        file(TOUCH "${SKIA_GSD_LOCK}")
+        message(STATUS "git-sync-deps complete")
     else ()
-        set(SKIA_GN_EXTRA_ARGS "is_debug=false extra_cflags=[\"/MD\"]")
+        message(STATUS "git-sync-deps: already done")
     endif ()
 
-    ExternalProject_Add(skia_external
-            SOURCE_DIR ${skia_SOURCE_DIR}
-            BINARY_DIR ${SKIA_BINARY_DIR}
-            DOWNLOAD_COMMAND ""
-            UPDATE_COMMAND ""
-            INSTALL_COMMAND ""
-            CONFIGURE_COMMAND ${skia_SOURCE_DIR}/bin/gn gen ${SKIA_GN_OUTPUT_DIR} "--args=is_official_build=false ${SKIA_GN_EXTRA_ARGS} skia_use_freetype=false skia_enable_graphite=true skia_use_vulkan=true" --root=${skia_SOURCE_DIR}
-            BUILD_COMMAND ninja -C ${SKIA_GN_OUTPUT_DIR} skia
-            BYPRODUCTS ${SKIA_LIB_OUTPUT}
-            USES_TERMINAL_CONFIGURE on
-            USES_TERMINAL_BUILD on
-    )
+    # Build Skia for Debug and Release at configure time.
+    foreach (SKIA_CFG Debug Release)
+        if (MSVC)
+            if (SKIA_CFG STREQUAL "Debug")
+                set(SKIA_GN_ARGS "is_official_build=false is_debug=true extra_cflags=[\"/MDd\"]")
+            else ()
+                set(SKIA_GN_ARGS "is_official_build=false is_debug=false extra_cflags=[\"/MD\"]")
+            endif ()
+        else ()
+            if (SKIA_CFG STREQUAL "Debug")
+                set(SKIA_GN_ARGS "is_official_build=false is_debug=true")
+            else ()
+                set(SKIA_GN_ARGS "is_official_build=false is_debug=false")
+            endif ()
+        endif ()
+        set(SKIA_GN_ARGS "${SKIA_GN_ARGS} skia_use_gl=false skia_enable_ganesh=false skia_enable_graphite=true skia_use_vulkan=true skia_use_freetype=true skia_use_system_freetype2=false skia_enable_pdf=false skia_enable_skottie=false skia_enable_svg=false skia_use_xps=false skia_use_dng_sdk=false skia_use_piex=false")
+
+        set(SKIA_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/skia-build/${SKIA_CFG}/out/Release")
+        set(SKIA_LIB "${SKIA_OUT_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}skia${CMAKE_STATIC_LIBRARY_SUFFIX}")
+
+        if (NOT EXISTS "${SKIA_LIB}")
+            message(STATUS "Building Skia (${SKIA_CFG})...")
+            execute_process(
+                COMMAND "${skia_SOURCE_DIR}/bin/gn" gen "${SKIA_OUT_DIR}"
+                    "--args=${SKIA_GN_ARGS}"
+                    "--root=${skia_SOURCE_DIR}"
+                WORKING_DIRECTORY "${skia_SOURCE_DIR}"
+                RESULT_VARIABLE GN_RESULT
+                OUTPUT_VARIABLE GN_OUT
+                ERROR_VARIABLE GN_OUT
+            )
+            if (NOT GN_RESULT EQUAL 0)
+                message(FATAL_ERROR "gn gen (${SKIA_CFG}) failed: ${GN_OUT}")
+            endif ()
+            execute_process(
+                COMMAND ninja -C "${SKIA_OUT_DIR}" skia
+                RESULT_VARIABLE NINJA_RESULT
+                OUTPUT_VARIABLE NINJA_OUT
+                ERROR_VARIABLE NINJA_OUT
+            )
+            if (NOT NINJA_RESULT EQUAL 0)
+                message(FATAL_ERROR "ninja (${SKIA_CFG}) failed: ${NINJA_OUT}")
+            endif ()
+        else ()
+            message(STATUS "Skipping Skia ${SKIA_CFG} (already built)")
+        endif ()
+    endforeach ()
 
     add_library(Skia::Skia STATIC IMPORTED GLOBAL)
-    add_dependencies(Skia::Skia skia_external)
-    target_include_directories(Skia::Skia
-            INTERFACE
-            "${skia_SOURCE_DIR}"
+    target_include_directories(Skia::Skia INTERFACE "${skia_SOURCE_DIR}")
+    set_target_properties(Skia::Skia PROPERTIES
+        IMPORTED_LOCATION_DEBUG "${CMAKE_CURRENT_BINARY_DIR}/skia-build/Debug/out/Release/${CMAKE_STATIC_LIBRARY_PREFIX}skia${CMAKE_STATIC_LIBRARY_SUFFIX}"
+        IMPORTED_LOCATION_RELEASE "${CMAKE_CURRENT_BINARY_DIR}/skia-build/Release/out/Release/${CMAKE_STATIC_LIBRARY_PREFIX}skia${CMAKE_STATIC_LIBRARY_SUFFIX}"
+        IMPORTED_LOCATION_RELWITHDEBINFO "${CMAKE_CURRENT_BINARY_DIR}/skia-build/Release/out/Release/${CMAKE_STATIC_LIBRARY_PREFIX}skia${CMAKE_STATIC_LIBRARY_SUFFIX}"
+        IMPORTED_LOCATION_MINSIZEREL "${CMAKE_CURRENT_BINARY_DIR}/skia-build/Release/out/Release/${CMAKE_STATIC_LIBRARY_PREFIX}skia${CMAKE_STATIC_LIBRARY_SUFFIX}"
+        IMPORTED_CONFIGURATIONS "Debug;Release;RelWithDebInfo;MinSizeRel"
     )
-    set_property(TARGET Skia::Skia PROPERTY IMPORTED_LOCATION "${SKIA_LIB_OUTPUT}")
 endif ()
 
 add_executable(codotaku_web main.cpp)

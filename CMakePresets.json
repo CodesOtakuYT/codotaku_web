@@ -3,8 +3,14 @@
     "configurePresets": [
         {
             "name": "default",
-            "displayName": "Visual Studio 2026 (x64)",
+            "displayName": "Visual Studio 2026 (x64) \u2014 Windows",
             "generator": "Visual Studio 18 2026",
+            "binaryDir": "${sourceDir}/build"
+        },
+        {
+            "name": "linux",
+            "displayName": "Ninja Multi-Config \u2014 Linux",
+            "generator": "Ninja Multi-Config",
             "binaryDir": "${sourceDir}/build"
         }
     ],
@@ -17,6 +23,17 @@
         {
             "name": "release",
             "configurePreset": "default",
+            "configuration": "RelWithDebInfo",
+            "targets": ["codotaku_web"]
+        },
+        {
+            "name": "linux-debug",
+            "configurePreset": "linux",
+            "configuration": "Debug"
+        },
+        {
+            "name": "linux-release",
+            "configurePreset": "linux",
             "configuration": "RelWithDebInfo",
             "targets": ["codotaku_web"]
         }
