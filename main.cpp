@@ -12,6 +12,8 @@
 #include "SDL3/SDL_log.h"
 #include "SDL3/SDL_timer.h"
 #include "SDL3/SDL_vulkan.h"
+#include "SDL3/SDL_mouse.h"
+#include "SDL3/SDL_video.h"
 #include <include/gpu/vk/VulkanBackendContext.h>
 #include "src/gpu/vk/vulkanmemoryallocator/VulkanMemoryAllocatorPriv.h"
 #include <include/gpu/vk/VulkanExtensions.h>
@@ -134,6 +136,8 @@ class DocumentContainer : public litehtml::document_container {
     std::string pageUrl_;
     sk_sp<SkFontMgr> m_fontMgr;
     std::map<std::string, sk_sp<SkImage> > images_;
+    std::string pendingNavigation_;
+    std::string requestedCursor_ = "auto";
 
 protected:
     int width_ = 800;
@@ -154,7 +158,21 @@ public:
 
     void set_page_url(const std::string &url) {
         pageUrl_ = url;
+        baseUrl_.clear(); // <base> from a previous page must not leak into the new one
     }
+
+    // Navigation requested by a link click, picked up by the host once the
+    // current event has finished (we must not destroy the document mid-event).
+    bool has_pending_navigation() const { return !pendingNavigation_.empty(); }
+
+    std::string take_pending_navigation() {
+        std::string url = std::move(pendingNavigation_);
+        pendingNavigation_.clear();
+        return url;
+    }
+
+    // CSS cursor keyword last requested for the hovered element ("auto", "pointer", ...).
+    const std::string &requested_cursor() const { return requestedCursor_; }
 
     void set_size(int w, int h) {
         width_ = w;
@@ -436,12 +454,15 @@ public:
     }
 
     void on_anchor_click(const char *url, const litehtml::element::ptr &el) override {
+        if (url && *url)
+            pendingNavigation_ = makeAbsolute(url, "");
     }
 
     void on_mouse_event(const litehtml::element::ptr &el, litehtml::mouse_event event) override {
     }
 
     void set_cursor(const char *cursor) override {
+        requestedCursor_ = cursor ? cursor : "auto";
     }
 
     void transform_text(litehtml::string &text, litehtml::text_transform tt) override {
@@ -545,6 +566,10 @@ struct App {
 
     AppDocumentContainer container;
     std::shared_ptr<litehtml::document> doc;
+
+    SDL_Cursor *cursorArrow_ = nullptr;
+    SDL_Cursor *cursorHand_ = nullptr;
+    std::string activeCursor_;
 
     struct Frame {
         VkSemaphore acquire = VK_NULL_HANDLE;
@@ -687,17 +712,11 @@ struct App {
 
         rebuildSurfaces();
 
-        std::string url = args.size() > 1 ? args[1] : "https://example.com";
-        container.set_page_url(url);
+        cursorArrow_ = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
+        cursorHand_ = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
 
-        std::string html;
-        if (!httpGet(url, html) || html.empty()) {
-            SDL_LogError(SDL_LOG_CATEGORY_ERROR, "Failed to load %s", url.c_str());
-            html = "<html><body><h1>Failed to load page</h1></body></html>";
-        }
-
-        doc = litehtml::document::createFromString(html.c_str(), &container);
         container.set_size(swapchain_.extent.width, swapchain_.extent.height);
+        loadPage(args.size() > 1 ? args[1] : "https://example.com");
 
         chkSDL(SDL_ShowWindow(window_));
         return SDL_APP_CONTINUE;
@@ -705,6 +724,11 @@ struct App {
 
     auto Iterate() -> SDL_AppResult {
         if (!context_) return SDL_APP_CONTINUE;
+
+        // A link clicked during event handling is resolved here, between frames,
+        // so we never replace the document while it is dispatching an event.
+        if (container.has_pending_navigation())
+            loadPage(container.take_pending_navigation());
 
         auto &frame = frames[frameIdx];
 
@@ -801,6 +825,38 @@ struct App {
             case SDL_EVENT_WINDOW_EXPOSED:
                 rebuildSwapchain();
                 return SDL_APP_CONTINUE;
+            case SDL_EVENT_MOUSE_MOTION: {
+                if (!doc) return SDL_APP_CONTINUE;
+                auto [x, y] = toCanvas(event->motion.x, event->motion.y);
+                litehtml::position::vector redraw;
+                doc->on_mouse_over(x, y, x, y, redraw);
+                applyCursor();
+                return SDL_APP_CONTINUE;
+            }
+            case SDL_EVENT_MOUSE_BUTTON_DOWN: {
+                if (!doc || event->button.button != SDL_BUTTON_LEFT) return SDL_APP_CONTINUE;
+                auto [x, y] = toCanvas(event->button.x, event->button.y);
+                litehtml::position::vector redraw;
+                doc->on_lbutton_down(x, y, x, y, redraw);
+                return SDL_APP_CONTINUE;
+            }
+            case SDL_EVENT_MOUSE_BUTTON_UP: {
+                if (!doc || event->button.button != SDL_BUTTON_LEFT) return SDL_APP_CONTINUE;
+                auto [x, y] = toCanvas(event->button.x, event->button.y);
+                litehtml::position::vector redraw;
+                // Fires on_anchor_click for a link under the cursor, which records
+                // the pending navigation consumed at the start of the next frame.
+                doc->on_lbutton_up(x, y, x, y, redraw);
+                applyCursor();
+                return SDL_APP_CONTINUE;
+            }
+            case SDL_EVENT_WINDOW_MOUSE_LEAVE: {
+                if (!doc) return SDL_APP_CONTINUE;
+                litehtml::position::vector redraw;
+                doc->on_mouse_leave(redraw);
+                applyCursor();
+                return SDL_APP_CONTINUE;
+            }
             default:
                 return SDL_APP_CONTINUE;
         }
@@ -819,6 +875,8 @@ struct App {
             if (f.presentFence != VK_NULL_HANDLE) vk_.destroyFence(f.presentFence, allocator);
         }
         frames.clear();
+        if (cursorArrow_) SDL_DestroyCursor(cursorArrow_);
+        if (cursorHand_) SDL_DestroyCursor(cursorHand_);
         vkb::destroy_swapchain(swapchain_);
         recorder_.reset();
         context_.reset();
@@ -830,6 +888,33 @@ struct App {
     }
 
 private:
+    // Fetch a URL and (re)build the document for it. Used for the initial page
+    // and for every link navigation.
+    void loadPage(const std::string &url) {
+        container.set_page_url(url);
+        std::string html;
+        if (!httpGet(url, html) || html.empty()) {
+            SDL_LogError(SDL_LOG_CATEGORY_ERROR, "Failed to load %s", url.c_str());
+            html = "<html><body><h1>Failed to load page</h1></body></html>";
+        }
+        doc = litehtml::document::createFromString(html.c_str(), &container);
+    }
+
+    // SDL reports mouse coordinates in window points; the canvas/document work
+    // in framebuffer pixels, so scale by the window's pixel density.
+    std::pair<int, int> toCanvas(float wx, float wy) const {
+        float scale = SDL_GetWindowPixelDensity(window_);
+        if (scale <= 0.0f) scale = 1.0f;
+        return {static_cast<int>(wx * scale), static_cast<int>(wy * scale)};
+    }
+
+    void applyCursor() {
+        const std::string &cursor = container.requested_cursor();
+        if (cursor == activeCursor_) return;
+        activeCursor_ = cursor;
+        SDL_SetCursor(cursor == "pointer" ? cursorHand_ : cursorArrow_);
+    }
+
     void rebuildSwapchain() {
         surfaces.clear();
 
