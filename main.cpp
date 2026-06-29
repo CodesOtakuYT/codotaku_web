@@ -5,6 +5,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <algorithm>
 #include <memory>
 #include <source_location>
 #include <span>
@@ -181,7 +182,7 @@ public:
 
     litehtml::uint_ptr create_font(const litehtml::font_description &descr, const litehtml::document *doc,
                                    litehtml::font_metrics *fm) override {
-        SkFontStyle style(descr.weight, SkFontStyle::kNormal_Weight,
+        SkFontStyle style(descr.weight, SkFontStyle::kNormal_Width,
                           descr.style == litehtml::font_style_italic
                               ? SkFontStyle::kItalic_Slant
                               : SkFontStyle::kUpright_Slant);
@@ -571,6 +572,9 @@ struct App {
     SDL_Cursor *cursorHand_ = nullptr;
     std::string activeCursor_;
 
+    float scrollY_ = 0.0f; // vertical scroll offset in canvas pixels
+    float maxScroll_ = 0.0f; // updated each frame once the document height is known
+
     struct Frame {
         VkSemaphore acquire = VK_NULL_HANDLE;
         VkSemaphore signal = VK_NULL_HANDLE;
@@ -754,12 +758,16 @@ struct App {
         container.set_size(swapchain_.extent.width, swapchain_.extent.height);
         doc->render(swapchain_.extent.width);
 
+        // Clamp the scroll offset now that the laid-out document height is known.
+        maxScroll_ = std::max(0.0f, doc->height() - static_cast<float>(swapchain_.extent.height));
+        scrollY_ = std::clamp(scrollY_, 0.0f, maxScroll_);
+
         SkPaint paint;
         paint.setColor(SkColors::kWhite);
         canvas->drawPaint(paint);
 
         litehtml::position clip(0, 0, swapchain_.extent.width, swapchain_.extent.height);
-        doc->draw(reinterpret_cast<litehtml::uint_ptr>(canvas), 0, 0, &clip);
+        doc->draw(reinterpret_cast<litehtml::uint_ptr>(canvas), 0, -scrollY_, &clip);
 
         auto recording = recorder_->snap();
         if (!recording) {
@@ -827,27 +835,42 @@ struct App {
                 return SDL_APP_CONTINUE;
             case SDL_EVENT_MOUSE_MOTION: {
                 if (!doc) return SDL_APP_CONTINUE;
-                auto [x, y] = toCanvas(event->motion.x, event->motion.y);
+                auto [cx, cy] = toCanvas(event->motion.x, event->motion.y);
                 litehtml::position::vector redraw;
-                doc->on_mouse_over(x, y, x, y, redraw);
+                doc->on_mouse_over(cx, cy + scrollY_, cx, cy, redraw);
                 applyCursor();
                 return SDL_APP_CONTINUE;
             }
             case SDL_EVENT_MOUSE_BUTTON_DOWN: {
                 if (!doc || event->button.button != SDL_BUTTON_LEFT) return SDL_APP_CONTINUE;
-                auto [x, y] = toCanvas(event->button.x, event->button.y);
+                auto [cx, cy] = toCanvas(event->button.x, event->button.y);
                 litehtml::position::vector redraw;
-                doc->on_lbutton_down(x, y, x, y, redraw);
+                doc->on_lbutton_down(cx, cy + scrollY_, cx, cy, redraw);
                 return SDL_APP_CONTINUE;
             }
             case SDL_EVENT_MOUSE_BUTTON_UP: {
                 if (!doc || event->button.button != SDL_BUTTON_LEFT) return SDL_APP_CONTINUE;
-                auto [x, y] = toCanvas(event->button.x, event->button.y);
+                auto [cx, cy] = toCanvas(event->button.x, event->button.y);
                 litehtml::position::vector redraw;
                 // Fires on_anchor_click for a link under the cursor, which records
                 // the pending navigation consumed at the start of the next frame.
-                doc->on_lbutton_up(x, y, x, y, redraw);
+                doc->on_lbutton_up(cx, cy + scrollY_, cx, cy, redraw);
                 applyCursor();
+                return SDL_APP_CONTINUE;
+            }
+            case SDL_EVENT_MOUSE_WHEEL: {
+                // SDL wheel y is positive when scrolling up; move the document the
+                // opposite way. ~3 lines per notch at the default 16px font size.
+                scrollY_ = std::clamp(scrollY_ - event->wheel.y * 48.0f, 0.0f, maxScroll_);
+                if (doc) {
+                    // Keep hover/cursor state in sync with the content now under the cursor.
+                    float mx, my;
+                    SDL_GetMouseState(&mx, &my);
+                    auto [cx, cy] = toCanvas(mx, my);
+                    litehtml::position::vector redraw;
+                    doc->on_mouse_over(cx, cy + scrollY_, cx, cy, redraw);
+                    applyCursor();
+                }
                 return SDL_APP_CONTINUE;
             }
             case SDL_EVENT_WINDOW_MOUSE_LEAVE: {
@@ -891,6 +914,7 @@ private:
     // Fetch a URL and (re)build the document for it. Used for the initial page
     // and for every link navigation.
     void loadPage(const std::string &url) {
+        scrollY_ = 0.0f; // every new page starts scrolled to the top
         container.set_page_url(url);
         std::string html;
         if (!httpGet(url, html) || html.empty()) {
